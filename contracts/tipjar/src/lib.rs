@@ -132,6 +132,12 @@ pub mod composable_nft;
 // Automated strategy execution for tip investments and yield optimization
 pub mod strategy;
 
+// Collateral management for DeFi integrations
+pub mod collateral;
+
+// Peer-to-peer lending protocol for tip tokens
+pub mod lending;
+
 /// A tip record that includes an optional memo and timestamp.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -684,6 +690,36 @@ pub struct CreditRecord {
     pub is_repayment: bool,
 }
 
+/// Sub-keys for the lending subsystem, used as `DataKey::Lending(LendingKey::...)`.
+#[derive(Clone)]
+#[contracttype]
+pub enum LendingKey {
+    /// Global lending pool configuration.
+    Config,
+    /// Lending pool state per token.
+    Pool(Address),
+    /// Loan record keyed by loan ID.
+    Loan(u64),
+    /// Global loan ID counter.
+    LoanCtr,
+    /// Borrower's active loan ID per token (one active loan per borrower/token).
+    BorrowerLoan(Address, Address),
+    /// List of all loan IDs for a borrower.
+    BorrowerLoans(Address),
+    /// List of all loan IDs for a lender.
+    LenderLoans(Address),
+    /// Lender deposit amount per token.
+    LenderDeposit(Address, Address),
+    /// List of token addresses a lender has deposited into.
+    LenderTokens(Address),
+    /// Interest rate model config per token.
+    RateModel(Address),
+    /// Lending feature enabled flag.
+    Enabled,
+    /// Lending admin address.
+    Admin,
+}
+
 /// Sub-keys for the insurance subsystem, used as `DataKey::Insurance(InsuranceKey::...)`.
 #[derive(Clone)]
 #[contracttype]
@@ -1018,6 +1054,22 @@ pub enum DataKey {
     RepToken(reputation_tokens::RepTokenKey),
     /// Composable NFT sub-keys.
     Nft(composable_nft::NftKey),
+    /// Lending subsystem keys (namespaced under LendingKey).
+    Lending(LendingKey),
+    /// Collateral position keyed by (depositor, token).
+    CollateralPosition(Address, Address),
+    /// Collateral ratio config keyed by token.
+    CollateralRatio(Address),
+    /// Total collateral locked for a token.
+    TotalCollateral(Address),
+    /// Total outstanding debt for a token.
+    TotalDebt(Address),
+    /// Liquidation event record keyed by liquidation ID.
+    LiquidationRecord(u64),
+    /// Global liquidation event counter.
+    LiquidationCounter,
+    /// List of token addresses a depositor has collateral positions in.
+    CollateralDepositorTokens(Address),
 }
 
 #[contracterror]
@@ -1064,6 +1116,20 @@ pub enum TipJarError {
     LmBoostTooLow = 25,
     /// Invalid duration parameter.
     InvalidDuration = 26,
+    /// Collateral token is not enabled for borrowing.
+    CollateralTokenNotEnabled = 27,
+    /// Collateral position has already been liquidated.
+    CollateralPositionLiquidated = 28,
+    /// No collateral position found for this depositor/token.
+    CollateralPositionNotFound = 29,
+    /// Collateral position is healthy; liquidation not allowed.
+    CollateralPositionHealthy = 30,
+    /// Collateral ratio configuration is invalid.
+    InvalidCollateralRatio = 31,
+    /// Repayment amount exceeds outstanding debt.
+    RepayExceedsDebt = 32,
+    /// Collateral is insufficient for the requested operation.
+    InsufficientCollateral = 33,
 }
 
 #[contracterror]
@@ -1533,6 +1599,129 @@ pub struct RiskAssessment {
     pub claim_ratio_bps: u32,
     /// Timestamp of this assessment.
     pub assessed_at: u64,
+}
+
+/// Status of a lending loan.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LoanStatus {
+    /// Loan is active and accruing interest.
+    Active,
+    /// Loan has been fully repaid.
+    Repaid,
+    /// Loan was liquidated due to under-collateralisation.
+    Liquidated,
+}
+
+/// Global configuration for the lending protocol.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LendingConfig {
+    /// Minimum collateral ratio in basis points (e.g. 15 000 = 150%).
+    pub collateral_ratio_bps: u32,
+    /// Liquidation threshold in basis points (e.g. 12 000 = 120%).
+    pub liquidation_threshold_bps: u32,
+    /// Liquidation penalty in basis points (e.g. 500 = 5%).
+    pub liquidation_penalty_bps: u32,
+    /// Base annual interest rate in basis points (e.g. 500 = 5%).
+    pub base_rate_bps: u32,
+    /// Utilisation multiplier — extra rate per 100% utilisation (bps).
+    pub utilisation_multiplier_bps: u32,
+    /// Protocol fee on interest payments in basis points (e.g. 1000 = 10%).
+    pub protocol_fee_bps: u32,
+    /// Minimum loan amount.
+    pub min_loan_amount: i128,
+    /// Maximum loan-to-value ratio in basis points (e.g. 6 667 = 66.67%).
+    pub max_ltv_bps: u32,
+    /// Whether the lending feature is enabled.
+    pub enabled: bool,
+}
+
+/// State of a lending pool for a specific token.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LendingPool {
+    /// Token this pool holds.
+    pub token: Address,
+    /// Total liquidity deposited by lenders.
+    pub total_deposits: i128,
+    /// Total amount currently borrowed.
+    pub total_borrowed: i128,
+    /// Total interest collected by the protocol.
+    pub total_protocol_fees: i128,
+    /// Total interest paid to lenders.
+    pub total_interest_paid: i128,
+    /// Timestamp of the last interest accrual.
+    pub last_accrual: u64,
+}
+
+/// A peer-to-peer loan record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LendingLoan {
+    /// Unique loan ID.
+    pub loan_id: u64,
+    /// Borrower address.
+    pub borrower: Address,
+    /// Token borrowed (and used as collateral).
+    pub token: Address,
+    /// Principal amount borrowed.
+    pub principal: i128,
+    /// Collateral amount locked.
+    pub collateral: i128,
+    /// Interest accrued but not yet paid.
+    pub interest_accrued: i128,
+    /// Timestamp when the loan was opened.
+    pub created_at: u64,
+    /// Timestamp of the last interest accrual.
+    pub last_accrual: u64,
+    /// Current loan status.
+    pub status: LoanStatus,
+}
+
+/// Errors for the lending protocol.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum LendingError {
+    /// Lending feature is not configured.
+    NotConfigured = 158,
+    /// Lending feature is disabled.
+    Disabled = 159,
+    /// Lending pool not found for this token.
+    PoolNotFound = 160,
+    /// Loan not found.
+    LoanNotFound = 161,
+    /// Borrower already has an active loan for this token.
+    ActiveLoanExists = 162,
+    /// Loan is not active (already repaid or liquidated).
+    LoanNotActive = 163,
+    /// Collateral amount is insufficient for the requested loan.
+    InsufficientCollateral = 164,
+    /// Repayment amount exceeds outstanding debt.
+    RepayExceedsDebt = 165,
+    /// Pool has insufficient liquidity to fund the loan.
+    InsufficientLiquidity = 166,
+    /// Loan amount is below the configured minimum.
+    LoanTooSmall = 167,
+    /// Loan-to-value ratio would exceed the maximum allowed.
+    LtvExceeded = 168,
+    /// Position is healthy; liquidation not allowed.
+    PositionHealthy = 169,
+    /// Caller is not the borrower.
+    NotBorrower = 170,
+    /// Caller is not the lender.
+    NotLender = 171,
+    /// Deposit amount must be positive.
+    InvalidDepositAmount = 172,
+    /// Withdrawal amount exceeds lender's deposit.
+    WithdrawalExceedsDeposit = 173,
+    /// Withdrawal would leave pool under-liquid (borrowed > remaining).
+    InsufficientPoolLiquidity = 174,
+    /// Collateral ratio config is invalid.
+    InvalidRatioConfig = 175,
+    /// Caller is not the lending admin.
+    Unauthorized = 176,
 }
 
 /// Unified insurance error enum.
@@ -7776,6 +7965,208 @@ impl TipJarContract {
         env.storage().persistent().get(&DataKey::Insurance(
             InsuranceKey::Risk(creator, token),
         ))
+    }
+
+    // ── lending protocol ─────────────────────────────────────────────────────
+
+    /// Configure the lending protocol.
+    ///
+    /// Admin only.  Must be called before any lending operations.
+    /// Emits `("lend_cfg",)` with `(collateral_ratio_bps, base_rate_bps, max_ltv_bps)`.
+    pub fn lending_configure(
+        env: Env,
+        admin: Address,
+        collateral_ratio_bps: u32,
+        liquidation_threshold_bps: u32,
+        liquidation_penalty_bps: u32,
+        base_rate_bps: u32,
+        utilisation_multiplier_bps: u32,
+        protocol_fee_bps: u32,
+        min_loan_amount: i128,
+        max_ltv_bps: u32,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, LendingError::Unauthorized);
+        }
+
+        // Validate ratio ordering
+        if collateral_ratio_bps < 10_000
+            || liquidation_threshold_bps >= collateral_ratio_bps
+            || liquidation_threshold_bps < 10_000
+        {
+            panic_with_error!(&env, LendingError::InvalidRatioConfig);
+        }
+        if liquidation_penalty_bps > 5_000 {
+            panic_with_error!(&env, LendingError::InvalidRatioConfig);
+        }
+        if max_ltv_bps == 0 || max_ltv_bps > 10_000 {
+            panic_with_error!(&env, LendingError::InvalidRatioConfig);
+        }
+        if protocol_fee_bps > 5_000 {
+            panic_with_error!(&env, LendingError::InvalidRatioConfig);
+        }
+        if min_loan_amount < 0 {
+            panic_with_error!(&env, LendingError::InvalidRatioConfig);
+        }
+
+        let config = LendingConfig {
+            collateral_ratio_bps,
+            liquidation_threshold_bps,
+            liquidation_penalty_bps,
+            base_rate_bps,
+            utilisation_multiplier_bps,
+            protocol_fee_bps,
+            min_loan_amount,
+            max_ltv_bps,
+            enabled: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Lending(LendingKey::Config), &config);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Lending(LendingKey::Enabled), &true);
+
+        env.events().publish(
+            (symbol_short!("lend_cfg"),),
+            (collateral_ratio_bps, base_rate_bps, max_ltv_bps),
+        );
+    }
+
+    /// Enable or disable the lending feature.  Admin only.
+    pub fn lending_set_enabled(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, LendingError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Lending(LendingKey::Enabled), &enabled);
+        env.events()
+            .publish((symbol_short!("lend_en"),), enabled);
+    }
+
+    /// Deposit `amount` of `token` into the lending pool to earn interest.
+    ///
+    /// Emits `("lend_dep",)` with `(lender, token, amount, new_total_deposits)`.
+    pub fn lending_deposit(env: Env, lender: Address, token: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        lending::pool::deposit(&env, &lender, &token, &amount);
+    }
+
+    /// Withdraw `amount` of `token` from the lending pool.
+    ///
+    /// Emits `("lend_wit",)` with `(lender, token, amount, new_total_deposits)`.
+    pub fn lending_withdraw(env: Env, lender: Address, token: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        lending::pool::withdraw(&env, &lender, &token, &amount);
+    }
+
+    /// Open a new loan: lock `collateral_amount` and borrow `loan_amount` of `token`.
+    ///
+    /// Returns the new loan ID.
+    /// Emits `("lend_opn",)` with `(loan_id, borrower, token, loan_amount, collateral_amount)`.
+    pub fn lending_open_loan(
+        env: Env,
+        borrower: Address,
+        token: Address,
+        loan_amount: i128,
+        collateral_amount: i128,
+    ) -> u64 {
+        Self::require_not_paused(&env);
+        lending::loans::open_loan(&env, &borrower, &token, loan_amount, collateral_amount)
+    }
+
+    /// Repay `repay_amount` toward an active loan.
+    ///
+    /// Emits `("lend_rep",)` with `(loan_id, repay_amount, remaining_principal, interest_paid)`.
+    pub fn lending_repay(env: Env, repayer: Address, loan_id: u64, repay_amount: i128) {
+        Self::require_not_paused(&env);
+        lending::loans::repay(&env, &repayer, loan_id, repay_amount);
+    }
+
+    /// Accrue interest on a loan without any payment.
+    pub fn lending_accrue(env: Env, loan_id: u64) {
+        lending::loans::accrue(&env, loan_id);
+    }
+
+    /// Liquidate an under-collateralised loan.
+    ///
+    /// Emits `("lend_liq",)` with `(loan_id, liquidator, collateral_seized, debt_repaid)`.
+    pub fn lending_liquidate(env: Env, liquidator: Address, loan_id: u64) {
+        Self::require_not_paused(&env);
+        lending::liquidation::liquidate(&env, &liquidator, loan_id);
+    }
+
+    /// Get the lending configuration.
+    pub fn lending_get_config(env: Env) -> Option<LendingConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Lending(LendingKey::Config))
+    }
+
+    /// Get the lending pool state for `token`.
+    pub fn lending_get_pool(env: Env, token: Address) -> Option<LendingPool> {
+        lending::pool::get_pool(&env, &token)
+    }
+
+    /// Get a loan record by ID.
+    pub fn lending_get_loan(env: Env, loan_id: u64) -> Option<LendingLoan> {
+        lending::loans::get_loan(&env, loan_id)
+    }
+
+    /// Get the active loan ID for `(borrower, token)`, or `None`.
+    pub fn lending_get_active_loan_id(
+        env: Env,
+        borrower: Address,
+        token: Address,
+    ) -> Option<u64> {
+        lending::loans::get_active_loan_id(&env, &borrower, &token)
+    }
+
+    /// Get all loan IDs ever opened by `borrower`.
+    pub fn lending_get_borrower_loans(env: Env, borrower: Address) -> Vec<u64> {
+        lending::loans::get_borrower_loans(&env, &borrower)
+    }
+
+    /// Get the lender's deposit balance for `token`.
+    pub fn lending_get_deposit(env: Env, lender: Address, token: Address) -> i128 {
+        lending::pool::get_deposit(&env, &lender, &token)
+    }
+
+    /// Get the current utilisation ratio in basis points (0–10 000).
+    pub fn lending_get_utilisation(env: Env, token: Address) -> u32 {
+        lending::pool::utilisation_bps(&env, &token)
+    }
+
+    /// Compute the current annual interest rate in basis points for `token`.
+    pub fn lending_get_current_rate(env: Env, token: Address) -> u32 {
+        let pool = lending::pool::get_pool(&env, &token);
+        let config = env
+            .storage()
+            .instance()
+            .get::<DataKey, LendingConfig>(&DataKey::Lending(LendingKey::Config));
+        match (pool, config) {
+            (Some(p), Some(c)) => {
+                lending::rates::current_rate_bps(p.total_deposits, p.total_borrowed, &c)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Compute the health factor of a loan (scaled by 1 000 000).
+    ///
+    /// Returns `i128::MAX` when there is no debt.
+    pub fn lending_get_health_factor(env: Env, loan_id: u64) -> i128 {
+        match lending::loans::get_loan(&env, loan_id) {
+            Some(loan) => lending::loans::health_factor(&env, &loan),
+            None => i128::MAX,
+        }
     }
 
     // ── cross-chain bridge ───────────────────────────────────────────────────

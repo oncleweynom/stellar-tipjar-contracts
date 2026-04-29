@@ -684,6 +684,38 @@ pub struct CreditRecord {
     pub is_repayment: bool,
 }
 
+/// Sub-keys for the insurance subsystem, used as `DataKey::Insurance(InsuranceKey::...)`.
+#[derive(Clone)]
+#[contracttype]
+pub enum InsuranceKey {
+    /// Pool configuration.
+    Cfg,
+    /// Pool state per token.
+    Token(Address),
+    /// Claim record keyed by claim ID.
+    Claim(u64),
+    /// Global claim ID counter.
+    Ctr,
+    /// Creator contribution per token.
+    Contrib(Address, Address),
+    /// Creator last claim timestamp per token.
+    LastClm(Address, Address),
+    /// Creator active claim count per token.
+    ActiveClms(Address, Address),
+    /// Creator total claim count per token.
+    TotalClms(Address, Address),
+    /// Insurance enabled flag.
+    Enabled,
+    /// Max active claims per creator.
+    MaxClms,
+    /// Insurance admin address.
+    Admin,
+    /// List of claim IDs for a creator per token.
+    Clms(Address, Address),
+    /// Risk assessment record keyed by (creator, token).
+    Risk(Address, Address),
+}
+
 /// Storage layout for persistent contract data.
 #[derive(Clone)]
 #[contracttype]
@@ -782,6 +814,8 @@ pub enum DataKey {
     PrivateTipCounter,
     /// Revealed amount for a private tip keyed by tip_id.
     PrivateTipAmount(u64),
+    /// Insurance subsystem keys (namespaced under InsuranceKey).
+    Insurance(InsuranceKey),
     /// Insurance pool configuration.
     InsPoolCfg,
     /// Insurance pool state per token.
@@ -806,6 +840,8 @@ pub enum DataKey {
     InsAdmin,
     /// List of claim IDs for a creator per token.
     InsClms(Address, Address),
+    /// Risk assessment record keyed by (creator, token).
+    InsRisk(Address, Address),
     /// Option contract by ID.
     Option(u64),
     /// Option counter for ID generation.
@@ -1030,8 +1066,6 @@ pub enum TipJarError {
     InvalidDuration = 26,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -1461,6 +1495,87 @@ pub enum ZkProofError {
     NotTipCreator = 612,
 }
 
+/// Risk level for a creator's insurance profile.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RiskLevel {
+    /// Low risk — strong tip history, few claims.
+    Low,
+    /// Medium risk — moderate history or some claims.
+    Medium,
+    /// High risk — limited history or frequent claims.
+    High,
+}
+
+/// Risk assessment snapshot for a creator/token pair.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskAssessment {
+    /// Creator address.
+    pub creator: Address,
+    /// Token address.
+    pub token: Address,
+    /// Computed risk score (0–10 000 bps; lower = safer).
+    pub risk_score_bps: u32,
+    /// Derived risk level bucket.
+    pub risk_level: RiskLevel,
+    /// Recommended premium rate in bps based on risk.
+    pub recommended_premium_bps: u32,
+    /// Recommended max coverage amount.
+    pub recommended_coverage: i128,
+    /// Total tips received (used as proxy for track record).
+    pub total_tips_received: i128,
+    /// Total claims ever submitted.
+    pub total_claims: u32,
+    /// Total amount paid out in claims.
+    pub total_claimed_amount: i128,
+    /// Claim-to-tip ratio in bps (total_claimed / total_received * 10000).
+    pub claim_ratio_bps: u32,
+    /// Timestamp of this assessment.
+    pub assessed_at: u64,
+}
+
+/// Unified insurance error enum.
+///
+/// Error codes are chosen to match the existing on-chain numbering so that
+/// clients that already handle `VestingError` / `StreamError` codes continue
+/// to work without changes.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum InsuranceError {
+    // ── from VestingError ────────────────────────────────────────────────────
+    DisputeUnauthorized = 51,
+    InsPoolNotCfg = 52,
+    ContributionTooLow = 53,
+    ContributionTooHigh = 54,
+    NoCoverage = 55,
+    ClaimNotApproved = 56,
+    ClaimAlreadyPaid = 57,
+    InsufficientReserves = 58,
+    ClaimCooldownActive = 59,
+    TooManyActiveClaims = 60,
+    // ── from StreamError ────────────────────────────────────────────────────
+    ClaimNotFound = 61,
+    AlreadyContributed = 62,
+    InsuranceDisabled = 63,
+    PendingClaimExists = 64,
+    PayoutExceedsReserves = 65,
+    InvalidClaimAmount = 66,
+    AdmAppReq = 67,
+    PrivateTipNotFound = 68,
+    InvalidReveal = 69,
+    StreamNotFound = 70,
+    StreamAlreadyCancelled = 71,
+    StreamNotStarted = 72,
+    StreamAlreadyCompleted = 73,
+    InvalidStreamAmount = 74,
+    InvalidStreamRate = 75,
+}
+
+// Keep the existing error enums intact so existing clients are unaffected.
+// InsuranceError above unifies the insurance-specific codes in one place.
+
 #[contract]
 pub struct TipJarContract;
 
@@ -1470,7 +1585,7 @@ impl TipJarContract {
 
     fn require_not_paused(env: &Env) {
         if Self::check_is_paused(env) {
-            panic_with_error!(env, TipJarError::ContractPaused);
+            panic_with_error!(env, FeatureError::ContractPaused);
         }
     }
 
@@ -7065,24 +7180,10 @@ impl TipJarContract {
         updated_claim.updated_at = env.ledger().timestamp();
         env.storage()
             .persistent()
-            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
+            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &updated_claim);
 
-        // Update pool
-        let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
-        let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
-        let mut updated_pool = pool.clone();
-        updated_pool.active_claims -= 1;
-        env.storage().persistent().set(&pool_key, &updated_pool);
-
-        // Update creator active claims
-        let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(
-            claim.creator.clone(),
-            claim.token.clone(),
-        ));
-        let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
-        env.storage()
-            .persistent()
-            .set(&active_key, &(active_claims - 1));
+        // Pool active_claims stays the same (claim is still active, just approved).
+        // We only decrement when the claim is paid or rejected.
 
         env.events()
             .publish((symbol_short!("clm_app"),), (claim_id, approver));
@@ -7122,17 +7223,18 @@ impl TipJarContract {
         updated_claim.updated_at = env.ledger().timestamp();
         env.storage()
             .persistent()
-            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
+            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &updated_claim);
 
-        if claim.status == ClaimStatus::Approved {
-            // Update pool
+        // Decrement active claims (claim is no longer active regardless of prior status)
+        {
             let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
-            let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
-            let mut updated_pool = pool.clone();
-            updated_pool.active_claims -= 1;
-            env.storage().persistent().set(&pool_key, &updated_pool);
+            if let Some(mut pool) = env.storage().persistent().get::<DataKey, InsurancePool>(&pool_key) {
+                if pool.active_claims > 0 {
+                    pool.active_claims -= 1;
+                }
+                env.storage().persistent().set(&pool_key, &pool);
+            }
 
-            // Update creator active claims
             let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(
                 claim.creator.clone(),
                 claim.token.clone(),
@@ -7140,7 +7242,7 @@ impl TipJarContract {
             let active_claims: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
             env.storage()
                 .persistent()
-                .set(&active_key, &(active_claims - 1));
+                .set(&active_key, &active_claims.saturating_sub(1));
         }
 
         env.events()
@@ -7214,7 +7316,7 @@ impl TipJarContract {
         updated_claim.updated_at = env.ledger().timestamp();
         env.storage()
             .persistent()
-            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
+            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &updated_claim);
 
         // Update creator's last claim time and active claims
         let last_claim_key = DataKey::Insurance(InsuranceKey::LastClm(
@@ -7436,25 +7538,9 @@ impl TipJarContract {
                     updated_claim.updated_at = env.ledger().timestamp();
                     env.storage()
                         .persistent()
-                        .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
+                        .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &updated_claim);
 
-                    // Update pool active claims
-                    let pool_key = DataKey::Insurance(InsuranceKey::Token(claim.token.clone()));
-                    let pool: InsurancePool = env.storage().persistent().get(&pool_key).unwrap();
-                    let mut updated_pool = pool.clone();
-                    updated_pool.active_claims -= 1;
-                    env.storage().persistent().set(&pool_key, &updated_pool);
-
-                    // Update creator active claims
-                    let active_key = DataKey::Insurance(InsuranceKey::ActiveClms(
-                        claim.creator.clone(),
-                        claim.token.clone(),
-                    ));
-                    let active_claims: u32 =
-                        env.storage().persistent().get(&active_key).unwrap_or(1);
-                    env.storage()
-                        .persistent()
-                        .set(&active_key, &(active_claims - 1));
+                    // active_claims count stays the same — claim is still active (just approved).
 
                     approved_count += 1;
                 }
@@ -7476,7 +7562,7 @@ impl TipJarContract {
                         updated_claim.updated_at = env.ledger().timestamp();
                         env.storage()
                             .persistent()
-                            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &claim);
+                            .set(&DataKey::Insurance(InsuranceKey::Claim(claim_id)), &updated_claim);
 
                         // Update creator last claim time
                         let last_claim_key = DataKey::Insurance(InsuranceKey::LastClm(
@@ -7523,6 +7609,173 @@ impl TipJarContract {
             .persistent()
             .get(&DataKey::Insurance(InsuranceKey::Clms(creator, token)))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Assess and persist the risk profile for a creator/token pair.
+    ///
+    /// Computes a risk score (0–10 000 bps) based on:
+    /// - Claim-to-tip ratio (higher ratio → higher risk)
+    /// - Number of total claims (more claims → higher risk)
+    /// - Pool reserve health (low reserves → higher risk)
+    ///
+    /// Returns the `RiskAssessment` record and stores it on-chain so it can be
+    /// queried cheaply by `insurance_get_risk_assessment`.
+    ///
+    /// Emits `("ins_risk",)` with data `(creator, token, risk_score_bps, risk_level)`.
+    pub fn insurance_assess_risk(env: Env, creator: Address, token: Address) -> RiskAssessment {
+        // ── gather raw data ──────────────────────────────────────────────────
+        let total_received: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorTotal(creator.clone(), token.clone()))
+            .unwrap_or(0);
+
+        let total_claims: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Insurance(InsuranceKey::TotalClms(
+                creator.clone(),
+                token.clone(),
+            )))
+            .unwrap_or(0);
+
+        let pool_opt: Option<InsurancePool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Insurance(InsuranceKey::Token(token.clone())));
+
+        let (pool_reserves, pool_contributions, total_claims_paid) = pool_opt
+            .as_ref()
+            .map(|p| (p.total_reserves, p.total_contributions, p.total_claims_paid))
+            .unwrap_or((0, 0, 0));
+
+        // ── claim-to-tip ratio (0–10 000 bps) ───────────────────────────────
+        // How much of what the creator received has been claimed back?
+        let claim_ratio_bps: u32 = if total_received > 0 {
+            ((total_claims_paid * 10_000) / total_received).min(10_000) as u32
+        } else if total_claims_paid > 0 {
+            10_000 // claimed more than received — maximum risk
+        } else {
+            0
+        };
+
+        // ── claim frequency score (0–3 000 bps) ─────────────────────────────
+        // Each claim adds 500 bps, capped at 3 000 (6 claims).
+        let claim_freq_score: u32 = (total_claims * 500).min(3_000);
+
+        // ── reserve health score (0–2 000 bps) ──────────────────────────────
+        // If reserves < 20% of contributions, add up to 2 000 bps.
+        let reserve_health_score: u32 = if pool_contributions > 0 {
+            let reserve_ratio = (pool_reserves * 10_000) / pool_contributions;
+            if reserve_ratio < 2_000 {
+                // reserves below 20% of contributions
+                2_000 - reserve_ratio as u32
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // ── composite risk score (0–10 000 bps) ─────────────────────────────
+        // Weighted: 50% claim ratio + 30% claim frequency + 20% reserve health
+        let raw_score = (claim_ratio_bps * 50
+            + claim_freq_score * 30
+            + reserve_health_score * 20)
+            / 100;
+        let risk_score_bps = raw_score.min(10_000);
+
+        // ── risk level bucket ────────────────────────────────────────────────
+        let risk_level = if risk_score_bps < 2_000 {
+            RiskLevel::Low
+        } else if risk_score_bps < 5_000 {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::High
+        };
+
+        // ── recommended premium (base 100 bps, scaled by risk) ──────────────
+        // Low: 100 bps, Medium: 200 bps, High: 400 bps
+        let recommended_premium_bps: u32 = match risk_level {
+            RiskLevel::Low => 100,
+            RiskLevel::Medium => 200,
+            RiskLevel::High => 400,
+        };
+
+        // ── recommended coverage (conservative for high-risk creators) ───────
+        let config_opt: Option<InsurancePoolConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Insurance(InsuranceKey::Cfg));
+
+        let payout_ratio = config_opt
+            .as_ref()
+            .map(|c| c.payout_ratio_bps)
+            .unwrap_or(5_000);
+
+        // Reduce coverage for riskier profiles
+        let coverage_multiplier: u32 = match risk_level {
+            RiskLevel::Low => payout_ratio,
+            RiskLevel::Medium => payout_ratio / 2,
+            RiskLevel::High => payout_ratio / 4,
+        };
+
+        let contrib: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Insurance(InsuranceKey::Contrib(
+                creator.clone(),
+                token.clone(),
+            )))
+            .unwrap_or(0);
+
+        let premium_earned = config_opt
+            .as_ref()
+            .map(|c| (total_received * c.tip_premium_bps as i128) / 10_000)
+            .unwrap_or(0);
+
+        let recommended_coverage =
+            ((contrib + premium_earned) * coverage_multiplier as i128) / 10_000;
+
+        // ── persist and emit ─────────────────────────────────────────────────
+        let assessment = RiskAssessment {
+            creator: creator.clone(),
+            token: token.clone(),
+            risk_score_bps,
+            risk_level,
+            recommended_premium_bps,
+            recommended_coverage,
+            total_tips_received: total_received,
+            total_claims,
+            total_claimed_amount: total_claims_paid,
+            claim_ratio_bps,
+            assessed_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(
+            &DataKey::Insurance(InsuranceKey::Risk(creator.clone(), token.clone())),
+            &assessment,
+        );
+
+        env.events().publish(
+            (symbol_short!("ins_risk"),),
+            (creator, token, risk_score_bps, recommended_premium_bps),
+        );
+
+        assessment
+    }
+
+    /// Retrieve the most recent risk assessment for a creator/token pair.
+    ///
+    /// Returns `None` if `insurance_assess_risk` has never been called for this pair.
+    pub fn insurance_get_risk_assessment(
+        env: Env,
+        creator: Address,
+        token: Address,
+    ) -> Option<RiskAssessment> {
+        env.storage().persistent().get(&DataKey::Insurance(
+            InsuranceKey::Risk(creator, token),
+        ))
     }
 
     // ── cross-chain bridge ───────────────────────────────────────────────────
